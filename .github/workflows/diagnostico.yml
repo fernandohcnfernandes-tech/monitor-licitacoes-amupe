@@ -1,0 +1,13 @@
+name: Diagnóstico PDF
+on:
+  workflow_dispatch:
+jobs:
+  diagnosticar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-python@v5.3.0
+        with:
+          python-version: "3.11"
+      - run: pip install requests beautifulsoup4 pdfplumber
+      - run: python diagnostico.py
