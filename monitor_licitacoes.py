@@ -3,6 +3,7 @@ Monitor de Licitações - Diário Municipal AMUPE
 Município: Abreu e Lima - PE
 Envia resumo diário por e-mail às 10h
 Análise do PDF feita por Inteligência Artificial (Claude API)
+VERSÃO: 4.0 — isolamento por cabeçalho de município + resumo em linguagem natural
 """
 
 import os
