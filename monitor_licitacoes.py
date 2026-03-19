@@ -6,6 +6,7 @@ Análise do PDF feita por Inteligência Artificial (Claude API)
 """
 
 import os
+import re
 import json
 import smtplib
 import requests
@@ -33,7 +34,7 @@ GMAIL_APP_PASS = os.environ["GMAIL_APP_PASS"]
 ANTHROPIC_KEY  = os.environ["ANTHROPIC_API_KEY"]
 
 URL_AMUPE    = "https://www.diariomunicipal.com.br/amupe/"
-CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+CLAUDE_MODEL  = "claude-sonnet-4-6"   # Sonnet: muito mais preciso que Haiku para classificacao
 TAMANHO_BLOCO = 80_000
 
 
@@ -103,143 +104,120 @@ def extrair_texto_pdf(caminho_pdf):
 #  ETAPA 3 — Análise por Inteligência Artificial (Claude)
 # ════════════════════════════════════════════════════════════
 
+# Padrão regex que detecta EXATAMENTE o cabeçalho "AVISO DE LICITAÇÃO"
+# A regex é a porteira: só passa quem tiver o cabeçalho correto.
+# A IA entra DEPOIS — apenas para enriquecer blocos já confirmados.
+_RE_AVISO = re.compile(
+    r"AVISO\s+DE\s+LICITA[CÇ][AÃ]O",
+    re.IGNORECASE
+)
+
+# Marcadores que indicam início de um NOVO ato (encerram o bloco atual)
+_RE_NOVO_ATO = re.compile(
+    r"^\s*(AVISO\s+DE|EXTRATO\s+DE|RESULTADO\s+DE|HOMOLOGA[CÇ][AÃ]O|"
+    r"ADJUDICA[CÇ][AÃ]O|DISPENSA\s+DE|INEXIGIBILIDADE|RATIFIC|"
+    r"PORTARIA\s+N|DECRETO\s+N|RESOLU[CÇ][AÃ]O\s+N|CONVOCA[CÇ][AÃ]O|"
+    r"SELE[CÇ][AÃ]O\s+SIMPLIFICADA|CONCURSO\s+P[UÚ]BLICO|"
+    r"TERMO\s+ADITIVO|RESCIS[AÃ]O\s+DE)",
+    re.IGNORECASE
+)
+
+
 def analisar_com_ia(texto_diario):
-    print("🤖 Enviando para análise da IA...")
-
-    blocos = [
-        texto_diario[i : i + TAMANHO_BLOCO]
-        for i in range(0, len(texto_diario), TAMANHO_BLOCO)
-    ]
-    print(f"   Texto dividido em {len(blocos)} bloco(s) para análise")
-
-    todos_avisos = []
-    for idx, bloco in enumerate(blocos, 1):
-        print(f"   Analisando bloco {idx}/{len(blocos)}...")
-        avisos_do_bloco = _chamar_claude(bloco, idx, len(blocos))
-        todos_avisos.extend(avisos_do_bloco)
-
-    # Remove duplicatas
-    vistos = set()
-    avisos_unicos = []
-    for av in todos_avisos:
-        chave = av.get("numero", "") + av.get("objeto", "")[:40]
-        if chave not in vistos:
-            vistos.add(chave)
-            avisos_unicos.append(av)
-
-    print(f"✅ IA encontrou {len(avisos_unicos)} Aviso(s) de Licitação de {MUNICIPIO}")
-    return avisos_unicos
-
-
-def _chamar_claude(texto_bloco, num_bloco, total_blocos):
     """
-    Chama a API do Claude em duas etapas:
-      1. EXTRAÇÃO: encontra candidatos a Aviso de Licitação no texto
-      2. VALIDAÇÃO: para cada candidato, confirma se realmente é um Aviso de Licitação
-    Isso elimina falsos positivos (contratos, convocações, homologações etc.)
+    Nova estratégia em duas etapas bem separadas:
+
+    ETAPA A — REGEX (porteira, 100% precisa):
+      Percorre linha a linha o texto do diário.
+      Só abre um bloco quando encontra "AVISO DE LICITAÇÃO" no cabeçalho.
+      Fecha o bloco no próximo ato administrativo.
+      Confirma que o bloco menciona Abreu e Lima.
+      → Resultado: lista de trechos de texto, cada um GARANTIDAMENTE um Aviso de Licitação.
+
+    ETAPA B — IA (enriquecedora, não porteira):
+      Recebe apenas os trechos já confirmados pela regex.
+      Tarefa: extrair número, modalidade, objeto, data e resumo.
+      Não decide mais o que é ou não é aviso — isso já foi resolvido.
     """
+    print("🔍 Etapa A: filtrando cabeçalhos com regex...")
+    linhas = texto_diario.splitlines()
+    municipio_upper = MUNICIPIO.upper()
 
-    # ── SYSTEM PROMPT: define a identidade rígida do modelo ──────────────────
-    # O system prompt é processado com maior peso que o user prompt.
-    # Aqui definimos quem o modelo É, não apenas o que ele deve fazer.
-    system_prompt = """Você é um filtro especializado em Diários Oficiais Municipais brasileiros.
-Sua ÚNICA função é identificar "Avisos de Licitação" genuínos.
+    blocos_confirmados = []
+    i = 0
+    n = len(linhas)
 
-DEFINIÇÃO ESTRITA — um Aviso de Licitação DEVE ter TODOS os três elementos abaixo:
-  1. Cabeçalho com as palavras "AVISO" e "LICITAÇÃO" (ou "PREGÃO", "TOMADA DE PREÇOS",
-     "CONCORRÊNCIA", "CHAMADA PÚBLICA") indicando abertura futura de processo licitatório.
-  2. Descrição do OBJETO — o que a Prefeitura pretende comprar ou contratar.
-  3. Indicação de data futura de abertura de propostas OU convite para retirada de edital.
+    while i < n:
+        linha = linhas[i].strip()
 
-PROIBIÇÕES ABSOLUTAS — você NUNCA deve incluir:
-  • Extrato de Contrato ou Ata (contrato já assinado — licitação encerrada)
-  • Homologação ou Adjudicação (resultado já publicado — licitação encerrada)
-  • Dispensa de Licitação ou Inexigibilidade (contratação direta, sem licitação)
-  • Convocação, Seleção Simplificada ou Concurso Público (são processos de pessoal, não licitação)
-  • Portaria, Decreto, Resolução (atos administrativos internos)
-  • Termo Aditivo ou Rescisão (alterações em contratos existentes)
-  • Ratificação de dispensa (confirmação de contratação direta)
-  • Qualquer ato de outro município que não seja {municipio}
+        if _RE_AVISO.search(linha):
+            # Abre um novo bloco a partir daqui
+            bloco_linhas = [linha]
+            j = i + 1
 
-Em caso de dúvida se algo é ou não Aviso de Licitação, NÃO inclua. Prefira falso negativo a falso positivo.""".format(municipio=MUNICIPIO)
+            while j < n:
+                prox = linhas[j].strip()
+                # Fecha o bloco se encontrar início de novo ato (mínimo 3 linhas coletadas)
+                if j > i + 2 and _RE_NOVO_ATO.match(prox):
+                    break
+                bloco_linhas.append(prox)
+                j += 1
 
-    # ── ETAPA 1: EXTRAÇÃO ─────────────────────────────────────────────────────
-    prompt_extracao = f"""Analise o trecho do Diário Oficial abaixo (bloco {num_bloco} de {total_blocos}).
+            bloco_texto = "\n".join(bloco_linhas)
 
-Encontre SOMENTE os trechos que contenham "Aviso de Licitação" do município de {MUNICIPIO}.
-Retorne APENAS um JSON com a lista de avisos encontrados.
-Se não houver nenhum, retorne exatamente: []
+            # Confirma que o bloco pertence a Abreu e Lima
+            if municipio_upper in bloco_texto.upper():
+                blocos_confirmados.append(bloco_texto.strip())
+                print(f"   ✅ Bloco confirmado pela regex: {linha[:60]}")
 
-Para cada aviso, extraia:
-  "cabecalho_original": as primeiras 2 linhas do aviso (texto exato como aparece no diário)
-  "numero": número e modalidade (ex: "Pregão Eletrônico nº 012/2025")
-  "modalidade": tipo de licitação
-  "objeto": o que a Prefeitura quer comprar ou contratar
-  "data_abertura": data de abertura das propostas (DD/MM/AAAA) ou ""
-  "valor_estimado": valor estimado ou ""
-  "resumo": 2 a 4 frases em português simples resumindo o aviso
+            i = j
+        else:
+            i += 1
 
-TEXTO DO DIÁRIO:
-{texto_bloco}"""
+    total_regex = len(blocos_confirmados)
+    print(f"   Regex encontrou {total_regex} bloco(s) com cabeçalho 'AVISO DE LICITAÇÃO' de {MUNICIPIO}")
 
-    avisos_brutos = _requisitar_api(system_prompt, prompt_extracao, num_bloco, "extração")
-    if not avisos_brutos:
+    if not blocos_confirmados:
+        print("   ℹ️  Nenhum Aviso de Licitação de Abreu e Lima publicado hoje.")
         return []
 
-    # ── ETAPA 2: VALIDAÇÃO ────────────────────────────────────────────────────
-    # Envia cada candidato de volta para a IA confirmar se é realmente
-    # um Aviso de Licitação válido. Essa segunda passagem elimina os falsos positivos.
-    prompt_validacao = f"""Abaixo está uma lista de candidatos a "Aviso de Licitação" extraídos do Diário Oficial de {MUNICIPIO}.
+    print("🤖 Etapa B: IA extraindo campos dos blocos confirmados...")
+    avisos = []
+    for idx, bloco in enumerate(blocos_confirmados, 1):
+        print(f"   Enriquecendo bloco {idx}/{total_regex}...")
+        aviso = _enriquecer_com_ia(bloco)
+        if aviso:
+            avisos.append(aviso)
 
-Sua tarefa: para cada item, responda SIM ou NÃO se é realmente um Aviso de Licitação válido,
-aplicando rigorosamente a definição do seu sistema.
-
-Regras de validação:
-  • SIM apenas se o item anuncia uma licitação FUTURA com objeto definido
-  • NÃO se for: extrato de contrato, homologação, adjudicação, dispensa, inexigibilidade,
-    convocação de pessoal, seleção simplificada, portaria, decreto, ratificação ou qualquer
-    ato que não seja abertura de nova licitação
-
-Retorne APENAS um JSON no formato:
-[
-  {{"indice": 0, "valido": true}},
-  {{"indice": 1, "valido": false}}
-]
-
-CANDIDATOS PARA VALIDAR:
-{json.dumps(avisos_brutos, ensure_ascii=False, indent=2)}"""
-
-    validacoes = _requisitar_api(system_prompt, prompt_validacao, num_bloco, "validação")
-
-    # Aplica o filtro de validação
-    if not validacoes or not isinstance(validacoes, list):
-        # Se a validação falhar, usa heurística de segurança como fallback
-        return _filtro_heuristico(avisos_brutos)
-
-    indices_validos = {
-        v["indice"] for v in validacoes
-        if isinstance(v, dict) and v.get("valido") is True
-    }
-
-    avisos_validados = [
-        av for i, av in enumerate(avisos_brutos)
-        if i in indices_validos
-    ]
-
-    # Remove o campo auxiliar antes de retornar
-    for av in avisos_validados:
-        av.pop("cabecalho_original", None)
-
-    reprovados = len(avisos_brutos) - len(avisos_validados)
-    if reprovados > 0:
-        print(f"   🔍 Validação: {len(avisos_validados)} aprovado(s), {reprovados} reprovado(s) "
-              f"(contratos/homologações/outros descartados)")
-
-    return avisos_validados
+    print(f"✅ Resultado final: {len(avisos)} Aviso(s) de Licitação de {MUNICIPIO}")
+    return avisos
 
 
-def _requisitar_api(system_prompt, user_prompt, num_bloco, etapa):
-    """Faz uma chamada à API do Claude e retorna o JSON parseado."""
+def _enriquecer_com_ia(bloco_texto):
+    """
+    Recebe um trecho de texto JÁ CONFIRMADO como Aviso de Licitação pela regex.
+    Pede à IA APENAS para extrair e estruturar os campos — não para classificar.
+    """
+    system_prompt = (
+        "Você é um assistente especializado em extrair informações estruturadas "
+        "de publicações do Diário Oficial Municipal. "
+        "O texto fornecido já foi confirmado como um Aviso de Licitação. "
+        "Sua única tarefa é extrair os campos solicitados com precisão."
+    )
+
+    user_prompt = f"""O texto abaixo é um Aviso de Licitação publicado no Diário Oficial de {MUNICIPIO}.
+Extraia os seguintes campos e retorne SOMENTE um objeto JSON válido, sem texto antes ou depois:
+
+  "numero"        : número e modalidade completos (ex: "Pregão Eletrônico nº 012/2025")
+  "modalidade"    : tipo de licitação (ex: "Pregão Eletrônico", "Tomada de Preços", "Chamada Pública")
+  "objeto"        : descrição objetiva do que a Prefeitura quer comprar ou contratar
+  "data_abertura" : data de abertura das propostas no formato DD/MM/AAAA, ou "" se não constar
+  "valor_estimado": valor estimado, ou "" se não constar
+  "resumo"        : 2 a 3 frases em português claro resumindo o aviso para um leitor leigo
+
+TEXTO DO AVISO:
+{bloco_texto}"""
+
     headers = {
         "Content-Type": "application/json",
         "x-api-key": ANTHROPIC_KEY,
@@ -247,7 +225,7 @@ def _requisitar_api(system_prompt, user_prompt, num_bloco, etapa):
     }
     payload = {
         "model": CLAUDE_MODEL,
-        "max_tokens": 4096,
+        "max_tokens": 1024,
         "system": system_prompt,
         "messages": [{"role": "user", "content": user_prompt}],
     }
@@ -257,53 +235,44 @@ def _requisitar_api(system_prompt, user_prompt, num_bloco, etapa):
             "https://api.anthropic.com/v1/messages",
             headers=headers,
             json=payload,
-            timeout=120,
+            timeout=60,
         )
         resp.raise_for_status()
     except requests.RequestException as e:
-        print(f"   ⚠️  Erro de conexão na {etapa} (bloco {num_bloco}): {e}")
-        return []
+        print(f"      ⚠️  Erro na API: {e}")
+        # Fallback: retorna campos básicos sem IA
+        return {
+            "numero": "Não identificado",
+            "modalidade": "Aviso de Licitação",
+            "objeto": "Ver texto original",
+            "data_abertura": "",
+            "valor_estimado": "",
+            "resumo": bloco_texto[:300],
+        }
 
     texto = resp.json()["content"][0]["text"].strip()
 
-    # Remove blocos markdown ```json ... ``` se presentes
+    # Remove blocos markdown se presentes
     if "```" in texto:
-        linhas = texto.splitlines()
-        texto = "\n".join(l for l in linhas if not l.strip().startswith("```")).strip()
+        texto = "\n".join(
+            l for l in texto.splitlines()
+            if not l.strip().startswith("```")
+        ).strip()
 
     try:
-        resultado = json.loads(texto)
-        return resultado if isinstance(resultado, list) else []
-    except json.JSONDecodeError as e:
-        print(f"   ⚠️  Resposta inválida na {etapa} (bloco {num_bloco}): {e}")
-        return []
+        aviso = json.loads(texto)
+        return aviso if isinstance(aviso, dict) else None
+    except json.JSONDecodeError:
+        # Fallback com texto bruto
+        return {
+            "numero": "Não identificado",
+            "modalidade": "Aviso de Licitação",
+            "objeto": "Ver texto original",
+            "data_abertura": "",
+            "valor_estimado": "",
+            "resumo": bloco_texto[:300],
+        }
 
-
-def _filtro_heuristico(avisos):
-    """
-    Fallback de segurança: filtra por palavras-chave que NÃO devem
-    aparecer em Avisos de Licitação legítimos.
-    Usado apenas se a etapa de validação da IA falhar.
-    """
-    PALAVRAS_PROIBIDAS = [
-        "extrato de contrato", "extrato de ata", "homologação", "homologacao",
-        "adjudicação", "adjudicacao", "dispensa de licitação", "dispensa de licitacao",
-        "inexigibilidade", "ratific", "convocação", "convocacao",
-        "seleção simplificada", "selecao simplificada", "concurso público",
-        "concurso publico", "termo aditivo", "rescisão", "rescisao",
-        "portaria", "decreto nº", "resolução", "resolucao",
-    ]
-    aprovados = []
-    for av in avisos:
-        texto_av = (av.get("numero", "") + " " + av.get("objeto", "") +
-                    " " + av.get("cabecalho_original", "")).lower()
-        if not any(p in texto_av for p in PALAVRAS_PROIBIDAS):
-            av.pop("cabecalho_original", None)
-            aprovados.append(av)
-    return aprovados
-
-
-# ════════════════════════════════════════════════════════════
 #  ETAPA 4 — Montar e enviar o e-mail
 # ════════════════════════════════════════════════════════════
 
