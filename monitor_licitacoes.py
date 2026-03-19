@@ -124,15 +124,29 @@ def extrair_texto_pdf(caminho_pdf):
 #  ETAPA 3 — Análise por Inteligência Artificial (Claude)
 # ════════════════════════════════════════════════════════════
 
-# Padrão regex que detecta EXATAMENTE o cabeçalho "AVISO DE LICITAÇÃO"
-# A regex é a porteira: só passa quem tiver o cabeçalho correto.
-# A IA entra DEPOIS — apenas para enriquecer blocos já confirmados.
+# ── Regex: cabeçalho que separa municípios no PDF ────────────────────────────
+# O PDF organiza as publicações por município, precedidas de um cabeçalho:
+#   ESTADO DE PERNAMBUCO
+#   MUNICÍPIO DE ABREU E LIMA
+# Detectamos esse cabeçalho para isolar APENAS a seção de Abreu e Lima.
+_RE_CABECALHO_MUNICIPIO = re.compile(
+    r"MUNIC[IÍ]PIO\s+DE\s+ABREU\s+E\s+LIMA",
+    re.IGNORECASE
+)
+
+# Cabeçalho genérico de município — marca o início de outro município (fim da seção)
+_RE_CABECALHO_OUTRO_MUNICIPIO = re.compile(
+    r"^\s*MUNIC[IÍ]PIO\s+DE\s+\w",
+    re.IGNORECASE
+)
+
+# Detecta "AVISO DE LICITAÇÃO" dentro da seção já isolada
 _RE_AVISO = re.compile(
     r"AVISO\s+DE\s+LICITA[CÇ][AÃ]O",
     re.IGNORECASE
 )
 
-# Marcadores que indicam início de um NOVO ato (encerram o bloco atual)
+# Marcadores de fim de um ato administrativo (fecha o bloco do aviso)
 _RE_NOVO_ATO = re.compile(
     r"^\s*(AVISO\s+DE|EXTRATO\s+DE|RESULTADO\s+DE|HOMOLOGA[CÇ][AÃ]O|"
     r"ADJUDICA[CÇ][AÃ]O|DISPENSA\s+DE|INEXIGIBILIDADE|RATIFIC|"
@@ -145,66 +159,92 @@ _RE_NOVO_ATO = re.compile(
 
 def analisar_com_ia(texto_diario):
     """
-    Nova estratégia em duas etapas bem separadas:
+    Estratégia em três etapas:
 
-    ETAPA A — REGEX (porteira, 100% precisa):
-      Percorre linha a linha o texto do diário.
-      Só abre um bloco quando encontra "AVISO DE LICITAÇÃO" no cabeçalho.
-      Fecha o bloco no próximo ato administrativo.
-      Confirma que o bloco menciona Abreu e Lima.
-      → Resultado: lista de trechos de texto, cada um GARANTIDAMENTE um Aviso de Licitação.
+    ETAPA A — ISOLAR A SEÇÃO DO MUNICÍPIO:
+      O PDF organiza as publicações por município, separadas pelo cabeçalho:
+        ESTADO DE PERNAMBUCO
+        MUNICÍPIO DE ABREU E LIMA
+      Primeiro isolamos todo o texto entre esse cabeçalho e o próximo município.
+      Isso garante que NENHUM conteúdo de outro município entre na análise.
 
-    ETAPA B — IA (enriquecedora, não porteira):
-      Recebe apenas os trechos já confirmados pela regex.
-      Tarefa: extrair número, modalidade, objeto, data e resumo.
-      Não decide mais o que é ou não é aviso — isso já foi resolvido.
+    ETAPA B — REGEX (dentro da seção isolada):
+      Procura "AVISO DE LICITAÇÃO" apenas dentro do texto já isolado.
+      Extrai cada bloco até o próximo ato administrativo.
+
+    ETAPA C — IA (enriquecedora):
+      Recebe os blocos confirmados e redige os campos em linguagem natural.
     """
-    print("🔍 Etapa A: filtrando cabeçalhos com regex...")
+    print("🔍 Etapa A: isolando seção do município no PDF...")
     linhas = texto_diario.splitlines()
-    municipio_upper = MUNICIPIO.upper()
-
-    blocos_confirmados = []
-    i = 0
     n = len(linhas)
 
-    while i < n:
-        linha = linhas[i].strip()
+    # ── 1. Encontra todas as ocorrências do cabeçalho de Abreu e Lima ─────────
+    indices_municipio = [
+        i for i, l in enumerate(linhas)
+        if _RE_CABECALHO_MUNICIPIO.search(l.strip())
+    ]
 
-        if _RE_AVISO.search(linha):
-            # Abre um novo bloco a partir daqui
-            bloco_linhas = [linha]
-            j = i + 1
-
-            while j < n:
-                prox = linhas[j].strip()
-                # Fecha o bloco se encontrar início de novo ato (mínimo 3 linhas coletadas)
-                if j > i + 2 and _RE_NOVO_ATO.match(prox):
-                    break
-                bloco_linhas.append(prox)
-                j += 1
-
-            bloco_texto = "\n".join(bloco_linhas)
-
-            # Confirma que o bloco pertence a Abreu e Lima
-            if municipio_upper in bloco_texto.upper():
-                blocos_confirmados.append(bloco_texto.strip())
-                print(f"   ✅ Bloco confirmado pela regex: {linha[:60]}")
-
-            i = j
-        else:
-            i += 1
-
-    total_regex = len(blocos_confirmados)
-    print(f"   Regex encontrou {total_regex} bloco(s) com cabeçalho 'AVISO DE LICITAÇÃO' de {MUNICIPIO}")
-
-    if not blocos_confirmados:
-        print("   ℹ️  Nenhum Aviso de Licitação de Abreu e Lima publicado hoje.")
+    if not indices_municipio:
+        print("   ℹ️  Cabeçalho 'MUNICÍPIO DE ABREU E LIMA' não encontrado no diário de hoje.")
+        print("   Nenhum Aviso de Licitação para enviar.")
         return []
 
-    print("🤖 Etapa B: IA extraindo campos dos blocos confirmados...")
+    print(f"   Cabeçalho do município encontrado {len(indices_municipio)} vez(es)")
+
+    # ── 2. Para cada ocorrência, captura o texto até o próximo município ───────
+    secoes_municipio = []
+    for idx_inicio in indices_municipio:
+        secao = []
+        for k in range(idx_inicio, n):
+            linha = linhas[k].strip()
+            # Para quando encontrar cabeçalho de OUTRO município
+            if k > idx_inicio + 2 and _RE_CABECALHO_OUTRO_MUNICIPIO.match(linha):
+                # Confirma que não é Abreu e Lima de novo
+                if not _RE_CABECALHO_MUNICIPIO.search(linha):
+                    break
+            secao.append(linha)
+        if secao:
+            secoes_municipio.append(secao)
+            print(f"   Seção capturada: {len(secao)} linhas")
+
+    # ── 3. Dentro de cada seção, busca "AVISO DE LICITAÇÃO" ───────────────────
+    print("🔍 Etapa B: buscando 'AVISO DE LICITAÇÃO' dentro da seção...")
+    blocos_confirmados = []
+
+    for secao in secoes_municipio:
+        i = 0
+        ns = len(secao)
+        while i < ns:
+            linha = secao[i]
+            if _RE_AVISO.search(linha):
+                bloco_linhas = [linha]
+                j = i + 1
+                while j < ns:
+                    prox = secao[j]
+                    if j > i + 2 and _RE_NOVO_ATO.match(prox):
+                        break
+                    bloco_linhas.append(prox)
+                    j += 1
+                bloco_texto = "\n".join(bloco_linhas).strip()
+                blocos_confirmados.append(bloco_texto)
+                print(f"   ✅ Aviso de Licitação encontrado: {linha[:70]}")
+                i = j
+            else:
+                i += 1
+
+    total = len(blocos_confirmados)
+    print(f"   Total: {total} Aviso(s) de Licitação de {MUNICIPIO}")
+
+    if not blocos_confirmados:
+        print("   ℹ️  Nenhum Aviso de Licitação publicado hoje para Abreu e Lima.")
+        return []
+
+    # ── 4. IA enriquece cada bloco confirmado ─────────────────────────────────
+    print("🤖 Etapa C: IA redigindo resumos em linguagem natural...")
     avisos = []
     for idx, bloco in enumerate(blocos_confirmados, 1):
-        print(f"   Enriquecendo bloco {idx}/{total_regex}...")
+        print(f"   Redigindo aviso {idx}/{total}...")
         aviso = _enriquecer_com_ia(bloco)
         if aviso:
             avisos.append(aviso)
@@ -226,14 +266,23 @@ def _enriquecer_com_ia(bloco_texto):
     )
 
     user_prompt = f"""O texto abaixo é um Aviso de Licitação publicado no Diário Oficial de {MUNICIPIO}.
-Extraia os seguintes campos e retorne SOMENTE um objeto JSON válido, sem texto antes ou depois:
+Extraia os campos abaixo e retorne SOMENTE um objeto JSON válido, sem texto antes ou depois.
 
   "numero"        : número e modalidade completos (ex: "Pregão Eletrônico nº 012/2025")
   "modalidade"    : tipo de licitação (ex: "Pregão Eletrônico", "Tomada de Preços", "Chamada Pública")
-  "objeto"        : descrição objetiva do que a Prefeitura quer comprar ou contratar
+  "objeto"        : descrição objetiva e direta do que a Prefeitura quer comprar ou contratar,
+                    em UMA frase clara. Não copie o texto original — reescreva com suas palavras.
   "data_abertura" : data de abertura das propostas no formato DD/MM/AAAA, ou "" se não constar
-  "valor_estimado": valor estimado, ou "" se não constar
-  "resumo"        : 2 a 3 frases em português claro resumindo o aviso para um leitor leigo
+  "valor_estimado": valor estimado da contratação, ou "" se não constar
+  "resumo"        : redija um parágrafo curto (3 a 4 frases) em linguagem simples e direta,
+                    como se estivesse explicando o aviso para uma pessoa leiga.
+                    NÃO copie trechos do texto original. Use suas próprias palavras.
+                    Inclua: o que a Prefeitura pretende contratar, por qual motivo ou finalidade,
+                    como participar (prazo, sistema), e o valor se disponível.
+                    Exemplo de tom esperado: "A Prefeitura de Abreu e Lima está abrindo licitação
+                    para contratar uma empresa de pavimentação. O objetivo é recuperar as ruas do
+                    bairro X. As empresas interessadas podem enviar propostas até 10/04/2025 pelo
+                    sistema ComprasNet. O valor máximo previsto é de R$ 500.000,00."
 
 TEXTO DO AVISO:
 {bloco_texto}"""
