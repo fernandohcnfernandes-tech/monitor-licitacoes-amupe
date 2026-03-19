@@ -84,19 +84,39 @@ def baixar_pdf_do_dia():
 # ════════════════════════════════════════════════════════════
 
 def extrair_texto_pdf(caminho_pdf):
-    print("📖 Extraindo texto do PDF...")
-    paginas = []
+    """
+    Extrai o texto do PDF respeitando o layout de DUAS COLUNAS do Diário AMUPE.
+
+    O problema: pdfplumber.extract_text() juntava as duas colunas numa mesma
+    linha, misturando conteúdo de municípios diferentes na mesma linha.
+    Ex: "AVISO DE LICITAÇÃO - Município A    PORTARIA Nº 01 - Município B"
+
+    A solução: divide cada página ao meio e extrai coluna esquerda e direita
+    separadamente. Assim cada bloco de texto fica isolado e a regex consegue
+    identificar os cabeçalhos sem interferência de outro município.
+    """
+    print("📖 Extraindo texto do PDF (modo duas colunas)...")
+    blocos = []
 
     with pdfplumber.open(caminho_pdf) as pdf:
         total = len(pdf.pages)
         print(f"   Total de páginas: {total}")
-        for i, pagina in enumerate(pdf.pages, 1):
-            texto = pagina.extract_text()
-            if texto and texto.strip():
-                paginas.append(f"[PÁGINA {i}]\n{texto.strip()}")
 
-    texto_completo = "\n\n".join(paginas)
-    print(f"   Texto extraído: {len(texto_completo):,} caracteres")
+        for i, pagina in enumerate(pdf.pages, 1):
+            largura = pagina.width
+            meio    = largura / 2
+
+            col_esq = pagina.within_bbox((0,    0, meio,    pagina.height))
+            col_dir = pagina.within_bbox((meio, 0, largura, pagina.height))
+
+            for lado, col in [("E", col_esq), ("D", col_dir)]:
+                txt = col.extract_text()
+                if txt and txt.strip():
+                    blocos.append(f"[PÁG {i}-{lado}]\n{txt.strip()}")
+
+    texto_completo = "\n\n".join(blocos)
+    print(f"   Blocos extraídos: {len(blocos)} (colunas separadas)")
+    print(f"   Total de caracteres: {len(texto_completo):,}")
     return texto_completo
 
 
