@@ -1,0 +1,30 @@
+name: Monitor Licitações AMUPE - Abreu e Lima
+
+on:
+  schedule:
+    # 10h horário de Brasília = 13h UTC
+    - cron: "0 13 * * 1-5"   # segunda a sexta
+    # Para rodar também sábado/domingo, troque por: "0 13 * * *"
+  workflow_dispatch:          # permite rodar manualmente pelo GitHub
+
+jobs:
+  monitorar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Executar monitor de licitações
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
+        run: python monitor_licitacoes.py
